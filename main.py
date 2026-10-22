@@ -1,19 +1,33 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-import pandas as pd
-import joblib
-import shap
 from contextlib import asynccontextmanager
-from fastapi.staticfiles import StaticFiles
+from pathlib import Path
+from typing import Literal
 
+import joblib
+import pandas as pd
+import shap
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+BASE_DIR = Path(__file__).resolve().parent
 
 ml_model = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    ml_model["model"] = joblib.load("model.pkl")
-    ml_model["threshold"] = joblib.load("best_threshold.pkl")
+    model = joblib.load(BASE_DIR / "model.pkl")
+    ml_model["model"] = model
+    ml_model["threshold"] = float(joblib.load(BASE_DIR / "best_threshold.pkl"))
+
+    # Build the SHAP explainers once (one per calibration fold)
+    ml_model["explainers"] = []
+    for calibrated in model.calibrated_classifiers_:
+        pipeline = calibrated.estimator
+        ml_model["explainers"].append((
+            pipeline.named_steps["preprocessor"],
+            shap.TreeExplainer(pipeline.named_steps["classifier"]),
+        ))
 
     yield
 
@@ -24,126 +38,88 @@ app = FastAPI(lifespan=lifespan)
 
 
 class LoanApplication(BaseModel):
-    person_age: int
-    person_income: float
-    person_home_ownership: str
-    person_emp_length: float
-    loan_intent: str
-    loan_grade: str
-    loan_amnt: float
-    loan_int_rate: float
-    loan_percent_income: float
-    cb_person_default_on_file: str
-    cb_person_cred_hist_length: int
+    person_age: int = Field(ge=18, le=100)
+    person_income: float = Field(gt=0)
+    person_home_ownership: Literal["RENT", "OWN", "MORTGAGE", "OTHER"]
+    person_emp_length: float = Field(ge=0, le=60)
+    loan_intent: Literal["PERSONAL", "EDUCATION", "MEDICAL", "VENTURE",
+                         "HOMEIMPROVEMENT", "DEBTCONSOLIDATION"]
+    loan_grade: Literal["A", "B", "C", "D", "E", "F", "G"]
+    loan_amnt: float = Field(gt=0)
+    loan_int_rate: float = Field(ge=0, le=100)
+    cb_person_default_on_file: Literal["Y", "N"]
+    cb_person_cred_hist_length: int = Field(ge=0)
+    # loan_percent_income is computed on the server, not sent by the client
 
 
-def get_risk_explanation(input_df):
-    """
-    Explain the main factors contributing to the risk prediction.
-    """
+def get_risk_explanation(input_df: pd.DataFrame):
+    """Top 5 factors behind the prediction, averaged over all calibration folds."""
+    columns_by_length = sorted(input_df.columns, key=len, reverse=True)
 
-    calibrated_model = ml_model["model"]
+    def original_column(transformed_name: str) -> str:
+        clean = transformed_name.split("__", 1)[-1]
+        for col in columns_by_length:
+            if clean == col or clean.startswith(col + "_"):
+                return col
+        return clean
 
-    # Get the underlying trained pipeline
-    calibrated_classifier = calibrated_model.calibrated_classifiers_[0]
-    pipeline = calibrated_classifier.estimator
+    totals = {}
+    explainers = ml_model["explainers"]
 
-    # Separate preprocessing and XGBoost model
-    preprocessor = pipeline.named_steps["preprocessor"]
-    xgb_model = pipeline.named_steps["classifier"]
+    for preprocessor, explainer in explainers:
+        transformed = preprocessor.transform(input_df)
+        names = preprocessor.get_feature_names_out()
 
-    # Transform input using the same preprocessing used during training
-    transformed_input = preprocessor.transform(input_df)
+        values = explainer.shap_values(transformed)
+        if isinstance(values, list):
+            values = values[-1]
+        values = values[0]
 
-    # Get feature names after one-hot encoding
-    feature_names = preprocessor.get_feature_names_out()
+        for name, value in zip(names, values):
+            col = original_column(name)
+            totals[col] = totals.get(col, 0.0) + float(value)
 
-    # SHAP explanation for the XGBoost model
-    explainer = shap.TreeExplainer(xgb_model)
-    shap_values = explainer.shap_values(transformed_input)
+    contributions = {col: total / len(explainers) for col, total in totals.items()}
+    top = sorted(contributions.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
 
-    # Make sure we have a simple 1D array
-    if isinstance(shap_values, list):
-        shap_values = shap_values[0]
-
-    shap_values = shap_values[0]
-
-    # Map transformed features back to original features
-    original_features = list(input_df.columns)
-
-    feature_contributions = {}
-
-    for feature_name, shap_value in zip(feature_names, shap_values):
-
-        # Remove transformer prefix
-        clean_name = feature_name.split("__", 1)[-1]
-
-        original_feature = clean_name
-
-        # Find which original column this transformed feature belongs to
-        for column in original_features:
-            if clean_name == column or clean_name.startswith(column + "_"):
-                original_feature = column
-                break
-
-        feature_contributions[original_feature] = (
-            feature_contributions.get(original_feature, 0)
-            + float(shap_value)
-        )
-
-    # Sort by absolute impact
-    sorted_features = sorted(
-        feature_contributions.items(),
-        key=lambda x: abs(x[1]),
-        reverse=True
-    )
-
-    explanations = []
-
-    for feature, contribution in sorted_features[:5]:
-
-        if contribution > 0:
-            direction = "increases"
-        else:
-            direction = "reduces"
-
-        explanations.append({
+    return [
+        {
             "feature": feature,
-            "impact": round(abs(contribution), 4),
-            "direction": direction
-        })
+            "impact": round(abs(value), 4),
+            "direction": "increases" if value > 0 else "reduces",
+        }
+        for feature, value in top
+    ]
 
-    return explanations
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.post("/predict")
 def predict(data: LoanApplication):
+    record = data.model_dump()
+    record["loan_percent_income"] = round(record["loan_amnt"] / record["person_income"], 2)
+    input_df = pd.DataFrame([record])
 
-    input_df = pd.DataFrame([data.model_dump()])
-
-    # Final calibrated probability
-    probability = float(
-        ml_model["model"].predict_proba(input_df)[:, 1][0]
-    )
-
-    threshold = float(ml_model["threshold"])
-
+    probability = float(ml_model["model"].predict_proba(input_df)[:, 1][0])
+    threshold = ml_model["threshold"]
     prediction = int(probability >= threshold)
 
-    # SHAP-based explanation
-    explanations = get_risk_explanation(input_df)
+    try:
+        explanations = get_risk_explanation(input_df)
+    except Exception as e:
+        print(f"Explanation failed: {e}")
+        explanations = []
 
     return {
         "default_probability": probability,
         "default_prediction": prediction,
         "threshold": threshold,
         "Result": "High Risk" if prediction == 1 else "Low Risk",
-        "explanations": explanations
+        "explanations": explanations,
     }
 
 
-app.mount(
-    "/",
-    StaticFiles(directory="static", html=True),
-    name="static"
-)
+app.mount("/", StaticFiles(directory=BASE_DIR / "static", html=True), name="static")
