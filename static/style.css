@@ -869,3 +869,25 @@ button#submitBtn.loading .btn-label {
     font-size: 10.5px;
   }
 }
+
+/* ============================================================
+   Placeholders (watermark hints)
+   ============================================================ */
+
+.field input::placeholder {
+  color: var(--ink-faint);
+  opacity: 0.75;
+  font-style: italic;
+}
+
+/* Dropdown shows faded "Select…" until a choice is made */
+.field select:invalid {
+  color: var(--ink-faint);
+  font-style: italic;
+}
+
+.field select option {
+  color: var(--ink);
+  background: var(--surface-2);
+  font-style: normal;
+}
